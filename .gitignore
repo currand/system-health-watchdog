@@ -1,0 +1,20 @@
+# Local catalog (user-specific services, not shared)
+catalog.local.yaml
+
+# State files (runtime error fingerprints, not shareable)
+state/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

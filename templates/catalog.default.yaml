@@ -1,0 +1,185 @@
+# catalog.default.yaml — Reference Template
+#
+# THIS IS NOT A WORKING CONFIG. It's a documented reference showing the catalog
+# schema with example entries. To generate a working catalog for YOUR machine:
+#
+#   bash scripts/setup.sh
+#
+# This discovers your Hermes infrastructure and writes catalog.local.yaml
+# (which is gitignored and never published).
+#
+# If catalog.local.yaml doesn't exist, the pre-scanner falls back to this file.
+# The fallback will fail all probes (these are example entries) — the scanner
+# reports a warning and should be configured with a real catalog.
+#
+# Full schema documentation: SKILL.md "Discovery Phase" section
+# Probe design guide: references/probe-design.md
+
+# ── Global Settings ────────────────────────────────────────────────────────
+global:
+  report_mode: silent          # silent | summary | verbose
+  dry_run: true                # When true, probes run but fixes are never applied
+
+# ── Service Catalog ────────────────────────────────────────────────────────
+services:
+
+  ############################################################################
+  # EXAMPLE — Launchd-Managed Service
+  #
+  # Created by setup.sh when it finds a plist at:
+  #   /Library/LaunchDaemons/ai.hermes.*.plist
+  #
+  # Probe: `launchctl list <label>` checks PID is present
+  # Diagnosis: tail logs, check launchctl output
+  # Fix: `launchctl kickstart -k system/<label>` is safe (no sudo, no URL)
+  ############################################################################
+
+  launchd-example:
+    name: "Hermes Example Daemon"
+    depends_on: ["system-dns"]
+    health_probes:
+      - name: "process_running"
+        type: process
+        command: "launchctl list ai.hermes.example"
+        passes_if: '"PID" in out'
+    diagnosis:
+      hypothesis_template: "{name} is {status} because {reason}"
+      tests:
+        - "launchctl list ai.hermes.example"
+        - "tail -10 ~/.hermes/logs/*.log 2>/dev/null || echo 'no logs'"
+    fixes:
+      - name: "kickstart"
+        risk: safe
+        max_retries: 3
+        action: "launchctl kickstart -k system/ai.hermes.example"
+        verify: "launchctl list ai.hermes.example | grep PID || true"
+
+  ############################################################################
+  # EXAMPLE — Unsupervised MCP Server (command-based)
+  #
+  # Created by setup.sh when config.yaml has an mcp_server with a `command:`.
+  # Probe matches the process name in ps aux.
+  # Fix: kill + restart (command captured from config).
+  #
+  # NOTE: The restart command is auto-generated from config but may need
+  # manual adjustment (working directory, shell context, etc.)
+  ############################################################################
+
+  mcp-example-command-based:
+    name: "Example MCP (command)"
+    depends_on: ["system-dns"]
+    health_probes:
+      - name: "process_running"
+        type: process
+        command: "ps aux | grep 'example-server.*server.py' | grep -v grep"
+        passes_if: "len(lines) >= 1"
+    diagnosis:
+      hypothesis_template: "{name} exited because {reason}"
+      tests:
+        - "tail -20 ~/.hermes/logs/mcp-stderr.log 2>/dev/null || echo 'no log'"
+    fixes:
+      - name: "restart-mcp"
+        risk: safe
+        max_retries: 3
+        action: "cd ~/example-mcp-server && nohup python3 src/server.py > /dev/null 2>&1 &"
+        verify: "sleep 3 && ps aux | grep example-server | grep -v grep || true"
+
+  ############################################################################
+  # EXAMPLE — External MCP Server (URL-based)
+  #
+  # Created by setup.sh when config.yaml has an mcp_server with a `url:`.
+  # Probe does an HTTP health check (Python stdlib, no curl).
+  # Fix: hands_off — can't restart an external service.
+  ############################################################################
+
+  mcp-example-url-based:
+    name: "Example MCP (url)"
+    depends_on: ["system-dns"]
+    health_probes:
+      - name: "http_responding"
+        type: http
+        url: "http://example-server:8080/health"
+        passes_if: "status == 200"
+    diagnosis:
+      tests:
+        - "hermes mcp list 2>&1 | head -10"
+    fixes:
+      - name: "report-unreachable"
+        risk: hands_off
+        max_retries: 0
+        action: ""
+        notes: "External MCP server — cannot auto-restart"
+
+  ############################################################################
+  # EXAMPLE — Docker Container
+  #
+  # Created by setup.sh when a Hermes-relevant Docker container is found.
+  # Probe: docker inspect for container running state.
+  # Fix: hands_off — container orchestration is Docker's job.
+  ############################################################################
+
+  docker-example:
+    name: "Docker Example"
+    depends_on: []
+    health_probes:
+      - name: "container_running"
+        type: process
+        command: "docker inspect example-container --format '{{.State.Running}}'"
+        passes_if: '"true" in out'
+    diagnosis:
+      tests:
+        - "docker inspect example-container --format '{{.State}}'"
+        - "docker logs example-container --tail 20 2>&1"
+    fixes:
+      - name: "report-down"
+        risk: hands_off
+        max_retries: 0
+        action: ""
+        notes: "Container restart is Docker's responsibility"
+
+  ############################################################################
+  # SYSTEM — DNS (always added by setup.sh)
+  #
+  # Checks that DNS resolution works. Other services depend on this.
+  # Fix: flush DNS cache (safe, no sudo needed on macOS 26+).
+  ############################################################################
+
+  system-dns:
+    name: "DNS Resolution"
+    depends_on: []
+    health_probes:
+      - name: "resolve_google"
+        type: process
+        command: "host google.com"
+        passes_if: '"has address" in out'
+    diagnosis:
+      tests:
+        - "scutil --dns | head -10"
+        - "cat /etc/resolv.conf"
+    fixes:
+      - name: "flush-dns"
+        risk: safe
+        max_retries: 3
+        action: "dscacheutil -flushcache && killall -HUP mDNSResponder"
+        verify: "sleep 2 && host google.com"
+
+  ############################################################################
+  # SYSTEM — Cron Jobs (always added by setup.sh)
+  ############################################################################
+
+  hermes-cron-jobs:
+    name: "Active Cron Jobs"
+    depends_on: []
+    health_probes:
+      - name: "jobs_exist"
+        type: process
+        command: "hermes cron list 2>&1"
+        passes_if: '"Next run" in out'
+    diagnosis:
+      tests:
+        - "hermes cron list"
+    fixes:
+      - name: "report-stuck"
+        risk: hands_off
+        max_retries: 0
+        action: ""
