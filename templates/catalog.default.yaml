@@ -160,7 +160,7 @@ services:
       - name: "flush-dns"
         risk: safe
         max_retries: 3
-        action: "dscacheutil -flushcache && killall -HUP mDNSResponder"
+        action: "dscacheutil -flushcache && killall -HUP mDNSResponder"  # macOS; Linux: resolvectl flush-caches
         verify: "sleep 2 && host google.com"
 
   ############################################################################

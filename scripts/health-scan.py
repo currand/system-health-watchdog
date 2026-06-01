@@ -18,6 +18,8 @@ Usage:
     python3 scripts/health-scan.py --dry-run
 """
 
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -585,6 +587,32 @@ def rotate_large_logs(log_dir=None):
     return rotated
 
 
+# ── Webhook Callback ──────────────────────────────────────────────────────────
+
+
+def _fire_webhook(url, payload, secret=""):
+    """POST the failure payload as JSON to the webhook URL with HMAC-SHA256.
+
+    Accepts any 2xx response (the Hermes webhook adapter returns 202).
+    Silently ignores empty/missing URLs. Logs failures to stderr so they
+    show up in cron logs but never interfere with the [SILENT] protocol.
+    """
+    if not url:
+        return
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        sig = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        headers["X-Hub-Signature-256"] = f"sha256={sig}"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status >= 300:
+                print(f"webhook returned {resp.status}", file=sys.stderr)
+    except (urllib.error.URLError, urllib.error.HTTPError, socket.timeout, OSError) as e:
+        print(f"webhook failed: {e}", file=sys.stderr)
+
+
 # ── Entry Point ────────────────────────────────────────────────────────────
 
 def main():
@@ -594,7 +622,13 @@ def main():
     parser.add_argument("--catalog", help="Path to catalog file")
     parser.add_argument("--dry-run", action="store_true", help="Override: force dry-run")
     parser.add_argument("--log-dir", help="Override log directory (default: ~/.hermes/logs)")
+    parser.add_argument("--webhook-url", help="URL to POST failure JSON to (or HEALTH_WEBHOOK_URL env)")
+    parser.add_argument("--webhook-secret", help="HMAC-SHA256 secret for webhook auth (or WEBHOOK_SECRET env)")
     args = parser.parse_args()
+
+    # Resolve webhook URL: CLI arg > env var > disabled
+    webhook_url = args.webhook_url or os.environ.get("HEALTH_WEBHOOK_URL") or ""
+    webhook_secret = args.webhook_secret or os.environ.get("WEBHOOK_SECRET") or ""
 
     try:
         catalog = load_catalog(args.catalog)
@@ -687,6 +721,7 @@ def main():
             print("[SILENT]")
     else:
         print(json.dumps(scan_result, indent=2))
+        _fire_webhook(webhook_url, scan_result, webhook_secret)
 
 
 if __name__ == "__main__":

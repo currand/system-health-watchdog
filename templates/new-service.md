@@ -23,7 +23,7 @@ services:
     health_probes:
       - name: "description_of_probe"
         type: process
-        command: "launchctl list com.example.label"
+        command: "launchctl list com.example.label"  # macOS; on Linux: systemctl is-active example-service
         passes_if: '"PID" in out'
       
       - name: "api_responding"

@@ -59,7 +59,7 @@ you're searching for.
 ```bash
 # Step 1: Find what process owns the port
 lsof -iTCP -sTCP:LISTEN -P -n | grep ':8000'
-# → python3.1  318  bob  ... TCP *:8000 (LISTEN)
+# → python3.1  318  user  ... TCP *:8000 (LISTEN)
 
 # Step 2: Get the full command line
 ps -p 318 -o pid,command

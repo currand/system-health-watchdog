@@ -16,7 +16,7 @@ later), Docker has already recovered it.
 Pre-scanner reports:
 ```json
 {
-  "service": "hindsight",
+  "service": "my-container",
   "failed_probes": ["container_running", "docker_socket"],
   "fingerprint": "error: no such object: <container>"
 }

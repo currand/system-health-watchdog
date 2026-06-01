@@ -1,6 +1,6 @@
 # System Health Watchdog
 
-Autonomous health monitoring and self-healing for AI agent infrastructure. A two-stage pipeline that periodically scans all running services, triages failures, applies safe auto-remediation, and learns from new error patterns — all while costing zero LLM tokens when everything is healthy.
+Autonomous health monitoring and self-healing for AI agent infrastructure. A two-stage pipeline that periodically scans all running services, triages failures, applies safe auto-remediation, and learns from new error patterns — all while minimizing LLM tokens when everything is healthy.
 
 ---
 
@@ -36,41 +36,12 @@ Autonomous health monitoring and self-healing for AI agent infrastructure. A two
 
 ---
 
-## Token Usage & Optimization
-
-### The Problem
-
-The original `SKILL.md` was ~24,000 characters (~6,000 tokens) and loaded on **every cron tick** — including the 95%+ of ticks where all services are healthy. At a 15-minute cron interval, that's **576,000 tokens/day** of unnecessary consumption.
-
-### The Solution: Aggressive Content Splitting
-
-We restructured the skill to minimize baseline token load:
-
-| Component | Original | Optimized | Savings |
-|-----------|----------|-------------|---------|
-| `SKILL.md` | ~24KB (~6K tokens) | ~4.2KB (~1,050 tokens) | **83%** |
-| Reference files | 0 | 12 (loaded conditionally) | N/A |
-| Baseline tick | ~6K tokens | ~1K tokens | **83%** |
-
-### Token Math
-
-**Before optimization:**
-- 96 ticks/day × ~6,000 tokens = **576,000 tokens/day**
-- Healthy ticks (95%): 91 × 6,000 = 546,000 wasted tokens
-- Failure ticks (5%): 5 × 6,000 = 30,000 necessary tokens
-
-**After optimization:**
-- 96 ticks/day × ~1,050 tokens = **100,800 tokens/day**
-- Healthy ticks (95%): 91 × 1,050 = 95,550 tokens
-- Failure ticks (5%): 5 × (1,050 + ~2,000 refs) = 15,250 tokens
-- **Daily savings: ~475,000 tokens (82.5%)**
-
-### How It Works
+## How It Works
 
 1. **Minimal `SKILL.md`** — Contains only what's needed every tick:
-   - 2-stage architecture (1 paragraph)
+   - 2-stage architecture
    - `context_from` JSON format
-   - 5 safety rules (condensed to 1-liners)
+   - 5 safety rules
    - Risk tiers table
    - Circuit breaker + cascading failure detection
    - Reference loading table ("load X when Y")
@@ -78,37 +49,13 @@ We restructured the skill to minimize baseline token load:
 
 2. **Conditional Reference Loading** — 12 reference files loaded **only** when relevant failures appear (see `SKILL.md` for the complete reference table).
 
-3. **`[SILENT]` Optimization** — When all probes pass, the pre-scanner outputs `[SILENT]` (8 bytes). The heartbeat agent sees this and outputs `[SILENT]` immediately without loading any references.
-
-4. **Smart Prompt** — The heartbeat prompt says "Load only the reference files relevant to the failure types detected", ensuring Docker failures don't load MCP references, etc.
-
-### Best Practices for Token Efficiency
-
-When extending this skill:
-
-1. **Always prefer references** — If a section is >500 chars and not needed every tick, move it to `references/`
-2. **Use the "load X when Y" pattern** — Make it explicit when the agent should load each reference
-3. **Keep `SKILL.md` under 4KB** — This maintains the ~1K token baseline
-4. **Test token usage** — Run `wc -c SKILL.md` after edits (target: <3,500 chars)
-5. **Avoid embedding examples** — Link to `templates/` or `references/` instead of embedding YAML/code blocks
-
-### Monitoring Token Usage
-
-Check actual token consumption:
-
-```bash
-# Check recent cron job token usage
-hermes session list --limit 10 | grep "system-health"
-
-# View a specific heartbeat run
-hermes session view <session-id> | grep -i "token"
-```
+3. **`[SILENT]` Optimization** — When all probes pass, the pre-scanner outputs `[SILENT]`
 
 ---
 
 ### Design Principles
 
-1. **Discovery through introspection, not shell scripts.** The agent discovers what services are running by reading config files, inspecting launchd/Docker/process tables using its own tools. No brittle shell scripts that hardcode paths and parsing logic.
+1. **Discovery through introspection, not shell scripts.** The agent discovers what services are running by reading config files, inspecting system/Docker/process tables using its own tools.
 
 2. **Stage 1 is observe-only.** The pre-scanner must not modify state, rotate logs, or change configuration. It detects, aggregates, and reports — nothing else.
 
@@ -160,9 +107,9 @@ python3 scripts/test-server.py &
 python3 scripts/health-scan.py  # → [SILENT] again
 ```
 
-### 4. Wire Cron Jobs
+### 4. Cron Jobs and Webhooks
 
-Two chained cron jobs: a zero-token pre-scanner, and an LLM heartbeat that only fires on failure.
+A cron job that runs tests. On failure, fires a webhook to start triage and repair (if possible and allowed)
 
 ---
 
@@ -194,7 +141,7 @@ services:
         verify: "launchctl list ai.hermes.my-service | grep PID || true"
 ```
 
-### Probe Types (Only 4)
+### Probe Types
 
 | `type` | Purpose | `passes_if` examples |
 |--------|---------|---------------------|
@@ -223,18 +170,6 @@ services:
 - Per-fix retries: 3 for safe, 1 for caution
 - Exhausted retries → escalate regardless of tier
 - Resets when error resolves
-
----
-
-## False Positive Recognition
-
-The most important rule: **do not restart a healthy service.**
-
-**Rule 1:** If a service fails ONLY its `log_scan` probe but passes `process_running` and `http_responding`, it's a historical artifact. No restart.
-
-**Rule 2:** If a launchd service shows `LastExitStatus=256` (crashed) but the process is running AND the HTTP endpoint responds, KeepAlive already recovered. No restart — that drops in-flight state.
-
-**Rule 3:** Always pair HTTP probes with a process-level probe for cross-reference.
 
 ---
 
@@ -282,7 +217,7 @@ global:
 
 1. **Wrapper path stale on skill move** — use auto-resolving `SCRIPT_DIR` in the wrapper script
 2. **Missing +x bit** — invoke via `python3 script.py` not `exec script.py`
-3. **Cron's sparse PATH** — export `/opt/homebrew/bin:${HOME}/.local/bin` in the wrapper
+3. **Cron's sparse PATH** — export common directories (`${HOME}/.local/bin`, platform-specific paths like `/opt/homebrew/bin`) in the wrapper. See `references/cron-pitfalls.md`.
 4. **Python3 without yaml** — use the agent's venv Python path
 5. **Forgotten `context_from`** — verify with `cronjob action=list | grep context_from`
 

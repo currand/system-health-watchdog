@@ -9,7 +9,7 @@ interpretation of past events.
 ```yaml
 - name: "process_running"
   type: process
-  command: "launchctl list ai.hermes.gateway"
+  command: "launchctl list ai.hermes.gateway"   # macOS; on Linux use: systemctl is-active hermes-gateway
   passes_if: '"PID" in out'
 ```
 
@@ -23,7 +23,7 @@ interpretation of past events.
 ```yaml
 - name: "container_running"
   type: process
-  command: "docker inspect hindsight --format='{{.State.Running}}'"
+  command: "docker inspect my-container --format='{{.State.Running}}'"
   passes_if: '"true" in out'
 ```
 
@@ -54,8 +54,8 @@ test something you can physically observe at the moment it runs:
 
 | Observable | How to test | Gotcha |
 |---|---|---|
-| Is the process running? | `launchctl list` / `ps aux` | — |
-| Did the process exit cleanly last time? | `launchctl list → LastExitStatus` | — |
+| Is the process running? | `launchctl list` (macOS) / `ps aux` (Linux) | — |
+| Did the process exit cleanly last time? | `launchctl list → LastExitStatus` (macOS) / `systemctl` (Linux) | — |
 | Does the HTTP endpoint respond? | `urllib.request → status code` | ⚠️ **SSH tunnels** on the same port intercept the probe — it checks the remote service, not local |
 | | | ⚠️ **Wrong path** — `/api/v1/health` may be `/health`. Always curl-test the exact probe URL |
 | | | ⚠️ **Interface binding** — service may listen on Tailscale IP, not `localhost`. Use `lsof -i :PORT` to check |
