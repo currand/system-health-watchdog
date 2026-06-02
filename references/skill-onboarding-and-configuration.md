@@ -18,7 +18,7 @@ Onboarding follows an 8-phase plan. Each phase builds on the previous one. Never
 |-------|------|------|
 | 1 | Skill install | Files exist, skill registered in Hermes |
 | 2 | Introspection | Discovered services written to catalog |
-| 3 | Webhook creation | Endpoint registered, HMAC secret wired |
+| 3 | Webhook creation | Subscription registered, `hermes webhook test` returns 202 |
 | 4 | Cron creation | Pre-scanner running every 15 min |
 | 5 | Probe creation | Probes written to catalog, all pass |
 | 6 | Testing | Probe failures catch real problems, not config bugs |
@@ -91,7 +91,7 @@ The watchdog is designed to **discover** services, not require a manual manifest
 | Source | What to look for | Probe type |
 |--------|------------------|------------|
 | Supervised daemons (`/Library/LaunchDaemons/` on macOS, `/etc/systemd/system/` on Linux) | Hermes service files | `process` — `launchctl list <label>` (macOS) or `systemctl is-active <name>` (Linux) |
-| Hermes config (`~/.hermes/config.yaml`) | `gateways.*`, `mcp_servers.*` | `process` + `http` |
+| Hermes config (`~/.hermes/config.yaml`) | `gateways.*`, `mcp_servers.*`, `memory.*`, `models.*` | `process` + `http` |
 | Docker (`docker ps -a`) | Running containers with Hermes infrastructure | `process` — `docker inspect` |
 | Process table (`ps aux`) | Python/Node MCP servers not managed by a supervisor | `process` — `ps aux` grep |
 | Cron jobs (`hermes cron list`) | Any active watchdog or maintenance jobs | `process` — `hermes cron list` |
@@ -146,7 +146,7 @@ When listing HTTP services, run `lsof -iTCP -sTCP:LISTEN -P -n` first. If you se
 Register a Hermes webhook subscription so Stage 1 (pre-scanner) failures trigger Stage 2 (agent triage).
 
 ### Architecture
-The pre-scanner POSTs failure JSON to the default gateway's webhook endpoint. The gateway authenticates the POST with HMAC-SHA256, then launches an agent session that loads this skill.
+The pre-scanner POSTs failure JSON to the default gateway's webhook endpoint. The gateway validates the POST (either HMAC-SHA256 or `INSECURE_NO_AUTH`), then launches an agent session that loads this skill.
 
 ### Steps
 
@@ -156,41 +156,66 @@ The pre-scanner POSTs failure JSON to the default gateway's webhook endpoint. Th
    # Must return 200
    ```
 
-2. **Generate or confirm the HMAC secret** — this is a shared secret that must match in three places:
+2. **Check if the gateway is loopback-only** — most default profiles bind to `127.0.0.1`, making the webhook unreachable from outside the machine. Confirm with:
+   ```bash
+   lsof -iTCP -sTCP:LISTEN -P -n | grep <GATEWAY_PORT>
+   ```
+   If the address is `127.0.0.1`, you can skip HMAC entirely and use `INSECURE_NO_AUTH`. This is the **preferred approach** — no shared secret to keep in sync, no silent drift failures:
+
+   ```bash
+   hermes webhook subscribe system-health-alerts \
+       --secret INSECURE_NO_AUTH \
+       --skills system-health-watchdog \
+       --deliver origin \
+       --description "Health pre-scanner failures"
+   ```
+
+   See `references/env-var-wiring.md` for details on the `INSECURE_NO_AUTH` pattern. The pre-scanner still signs its POSTs with `WEBHOOK_SECRET` from `.env` — the gateway just doesn't validate the signature.
+
+3. **Fallback: external gateway (HMAC required)** — if the gateway binds to `0.0.0.0` or another non-loopback address, the HMAC 3-way match is required:
    - `~/.hermes/.env` as `WEBHOOK_SECRET`
-   - Gateway config (`~/.hermes/config.yaml` under `webhook.extra.secret`) as ${WEBHOOK_SECRET}
+   - Gateway config (`~/.hermes/config.yaml` under `webhook.extra.secret`) as `${WEBHOOK_SECRET}`
    - `~/.hermes/webhook_subscriptions.json` under the `system-health-alerts` entry
 
-   If no secret exists, generate one:
+   Generate a secret if none exists:
    ```bash
    openssl rand -hex 32
    ```
 
-3. **Wire the three-way match** — see `references/env-var-wiring.md` for exact locations and formats. Every place must have the same value. A mismatch produces `HTTP Error 401` from the gateway.
-
-4. **Register the subscription** — ensure `~/.hermes/webhook_subscriptions.json` has an entry:
-   ```json
-   {
-     "system-health-alerts": {
-       "skill": "system-health-watchdog",
-       "deliver": "origin"
-     }
-   }
+   Then register the subscription with the matching secret — always use shell expansion, never hardcode the value:
+   ```bash
+   source ~/.hermes/.env 2>/dev/null || true
+   hermes webhook subscribe system-health-alerts \
+       --secret "$WEBHOOK_SECRET" \
+       --skills system-health-watchdog \
+       --deliver origin \
+       --description "Health pre-scanner failures"
    ```
 
-5. **Verify the webhook URL in the pre-scanner** — the shell wrapper (`health-scan.sh` at `~/.hermes/scripts/`) passes `--webhook-url http://localhost:<GATEWAY_PORT>/webhooks/system-health-alerts` to `health-scan.py`. Make sure the URL matches the subscription name exactly. The port is determined by the gateway that handles the subscription — typically `:8644` for the default gateway.
+   See `references/env-var-wiring.md` for the full three-way match locations and formats. A mismatch produces `HTTP Error 401` from the gateway.
 
-6. **Test end-to-end** — force a probe failure (e.g., check a DNS name that doesn't exist in `system-dns` temporarily) and run the pre-scanner manually. Check the gateway logs for:
+4. **Verify with a test POST** — the Hermes CLI can send a test payload to confirm the subscription works without forcing a probe failure:
+   ```bash
+   hermes webhook test system-health-alerts
+   ```
+   Expected response: `202` with `{"status": "accepted", ...}`. If you get 401, the secret doesn't match — re-check step 3.
+
+5. **Verify the webhook URL in the pre-scanner** — the shell wrapper (`health-scan.sh` at `~/.hermes/scripts/`) passes `--webhook-url http://localhost:<GATEWAY_PORT>/webhooks/system-health-alerts` to `health-scan.py`. Make sure the URL matches the subscription name exactly.
+
+   **⚠️ Pitfall: hardcoded port in the shell wrapper.** If the shell wrapper hardcodes a port (e.g. `http://localhost:8644/webhooks/...`), changing the gateway port later silently breaks the pre-scanner without any cron error — failures print to stdout but no triage session fires. The wrapper should read the URL from an env var (`HEALTH_WEBHOOK_URL`) that's set independently, or match the gateway config. See Phase 4 step 1 for wrapper creation.
+
+6. **Test end-to-end with a real failure** — force a probe failure (e.g., check a DNS name that doesn't exist in `system-dns` temporarily) and run the pre-scanner manually. Check the gateway logs for:
    ```
    "received webhook POST" ... "status: 202"
    ```
-   If you see 401, the HMAC secret doesn't match somewhere. Go back to step 2.
+   If you see 401, the HMAC secret doesn't match somewhere. Go back to step 3.
 
 ### Outcome
-- Webhook subscription registered on the default gateway
-- HMAC secret identical in `.env`, `config.yaml`, and `webhook_subscriptions.json`
+- Gateway binding determined (loopback vs external)
+- Subscription registered — preferred `INSECURE_NO_AUTH` for loopback, HMAC for external
+- `hermes webhook test` returns 202
 - Manual probe failure triggers a 202 from the gateway
-- Bad HMAC produces 401, not silent failure
+- Bad HMAC produces 401 (only relevant for external gateways)
 
 ---
 
@@ -202,7 +227,7 @@ Schedule the pre-scanner to run every 15 minutes with `no_agent=true`.
 ### Steps
 
 1. **Create the shell wrapper** — the cron job doesn't call `health-scan.py` directly. It calls a shell wrapper at `~/.hermes/scripts/health-scan.sh` that:
-   - Sources the `.env` file for `WEBHOOK_SECRET` and `WEBHOOK_URL`
+   - Sources the `.env` file for `WEBHOOK_SECRET` and `HEALTH_WEBHOOK_URL`
    - Resolves the Hermes venv Python (see `references/cron-pitfalls.md`)
    - Calls `health-scan.py` with the right arguments
    - Handles PATH resolution (common tool directories, platform-specific paths) since cron/launchd/systemd has a minimal PATH
@@ -211,6 +236,12 @@ Schedule the pre-scanner to run every 15 minutes with `no_agent=true`.
    - Export `WEBHOOK_SECRET` before calling Python
    - Use `set -euo pipefail`
    - Print stderr to logger or a log file (not lost to the void)
+
+   **⚠️ Pitfall: hardcoded port in webhook URL.** If the wrapper hardcodes `http://localhost:8644/webhooks/...` instead of reading from an env var, changing the gateway port later silently breaks the pre-scanner. Use a default that's easy to override:
+   ```bash
+   export HEALTH_WEBHOOK_URL="${HEALTH_WEBHOOK_URL:-http://localhost:8644/webhooks/system-health-alerts}"
+   ```
+   This way an env var override takes precedence, and the default is a visible convention rather than a buried constant.
 
 2. **Create the cron job** — use `hermes cron` to create a job with these properties:
    ```bash
@@ -514,3 +545,4 @@ Use this section when the watchdog itself isn't working — cron silent, no webh
 - **Jumping from Phase 1 to Phase 8.** Every skipped phase is a future 3AM debugging session. The phases exist because real deployers found every single shortcut the hard way.
 - **Hardcoding absolute paths in probes.** Use `~/.hermes/...` or `$HOME` (with awareness that `$HOME` is unreliable in cron — see `references/cron-pitfalls.md`).
 - **Setting `dry_run: false` before Phase 7.** User approval is the safety gate. An unapproved catalog with `dry_run: false` can restart production services at 3AM.
+- **Hardcoding the gateway port in the shell wrapper.** Writing `http://localhost:8644/webhooks/...` directly in the wrapper script ties the pre-scanner to a specific port. Changing the gateway port later (multi-profile setup, port conflict) breaks the webhook silently. Use an env var default pattern instead: `HEALTH_WEBHOOK_URL="${HEALTH_WEBHOOK_URL:-http://localhost:8644/webhooks/system-health-alerts}"`.

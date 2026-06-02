@@ -1,121 +1,151 @@
 # System Health Watchdog
 
-Autonomous health monitoring and self-healing for AI agent infrastructure. A two-stage pipeline that periodically scans all running services, triages failures, applies safe auto-remediation, and learns from new error patterns — all while minimizing LLM tokens when everything is healthy.
+Keeps an eye on your Hermes infrastructure. If something breaks, it figures out what went wrong, tries to fix it, and lets you know. Costs nothing to run when everything's fine.
 
----
+## How the Two Stages Work
 
-## Architecture (2-Stage Pipeline)
+A cron job fires a Python script every 15 minutes. The script pokes all your services (gateways, MCP servers, Docker containers, whatever you told it to watch). If everything passes, it prints `[SILENT]` and the cron scheduler tosses that output in the trash. No delivery, no LLM, no tokens spent.
+
+When something fails, the script POSTs the failure details to a local webhook on your Hermes gateway. That webhook spins up an agent session, which loads this skill, pings you with a "🚨 hey I'm on it" message, and starts working through the problem.
 
 ```
  cron: */15 * * * *
        │
        ▼
-┌──────────────────────────────────┐  no_agent=True, script only
-│  STAGE 1: Pre-scanner Script     │  Zero tokens when healthy
-│  (health-scan.py)                │  Reads catalog.yaml for service
-│                                  │  definitions + probes
-│  Runs probes → all green?        │
-│  → [SILENT] output, no delivery  │
-│  → JSON failures → passed as     │
-│    context to Stage 2            │
-└──────────┬───────────────────────┘
-           │ context_from=job_id
+┌─────────────────────────────────────┐  Pure Python, no agent
+│  STAGE 1: health-scan.py            │  Zero tokens if healthy
+│                                     │
+│  Runs probes, all green?            │
+│  → prints [SILENT] → cron swallows  │
+│  → any failures? POST JSON + HMAC   │
+└──────────┬──────────────────────────┘
+           │ webhook POST
            ▼
-┌──────────────────────────────────┐  no_agent=False, LLM-driven
-│  STAGE 2: LLM Heartbeat          │  Only fires when failures exist
-│  Loads catalog → triages →       │  Fix commands go through
-│  applies fixes → verifies →      │  safety guardrails
-│  learns new patterns             │
-└──────────────────────────────────┘
+┌─────────────────────────────────────┐  Agent session, POST-only
+│  STAGE 2: Triage Agent              │
+│                                     │
+│  Loads skill → notifies user →      │
+│  triages failures → applies fixes   │
+│  → verifies → reports final status  │
+│                                     │
+│  ⚠️ Terminal tools need explicit    │
+│     config — see below              │
+└─────────────────────────────────────┘
 ```
 
-| Stage | What it does | Token cost | Safety |
-|-------|-------------|-----------|--------|
-| **1: Pre-scanner** (no_agent) | Runs health probes from catalog file via Python script | **Zero** when healthy — `[SILENT]` | Curated script on disk, not dynamic |
-| **2: LLM Heartbeat** (agent) | Triages failures, applies fixes, verifies, saves new patterns | Only when failures exist | Every `terminal()` call scanned by guardrails |
+## What You Actually Want to Know
+
+### The Agent Tells You When It's Working
+
+The first thing the triage agent does is fire off a 🚨 **Health Watchdog: Triaging N failure(s)** message to wherever your webhook delivers (Discord, Telegram, wherever). That way you see something happening before it's done. When it finishes, or gets stuck on something it can't fix, you get a follow-up.
+
+### Self-healing needs explicit permission for tools
+
+Webhook agent sessions are read-only by default. Webhooks can receive untrusted data (public PR comments, random pings from the internet), so Hermes doesn't hand out terminal access to webhook agents unless you specifically say so.
+
+Out of the box, the triage agent can use `web_search`, `web_extract`, `vision_analyze`, and `clarify`. It can figure out what's wrong and tell you the fix. It just can't run the fix.
+
+To let it actually do things, add this to `~/.hermes/config.yaml`:
+
+```yaml
+platform_toolsets:
+  webhook:
+  - hermes-cli
+```
+
+Only do this if your gateway is loopback only (127.0.0.1). If it's public facing, leave the default and have the agent tell you what commands to run.
+
+### Why This Setup Costs Nothing When Things Are Good
+
+The pre-scanner is a plain Python script. No LLM, no agent loop, no token spend. When everything passes, it prints `[SILENT]` and exits. The cron scheduler sees that, shrugs, and moves on. Stage 2 doesn't have a cron job at all. It only fires when the pre-scanner POSTs a failure. So healthy hours cost exactly nothing.
+
+The SKILL.md links to separate reference files for Docker failures, cron debugging, HMAC wiring, probe design, and so on. The agent loads only the one it needs for whatever broke. No point pulling in the Docker container recovery guide when an MCP server just crashed.
 
 ---
 
-## How It Works
+## Installation and Maintenance via Agent Prompt
 
-1. **Minimal `SKILL.md`** — Contains only what's needed every tick:
-   - 2-stage architecture
-   - `context_from` JSON format
-   - 5 safety rules
-   - Risk tiers table
-   - Circuit breaker + cascading failure detection
-   - Reference loading table ("load X when Y")
-   - Dry-run + report modes
+Your agent knows how to set this up — the SKILL.md covers the details. Just say what you need.
 
-2. **Conditional Reference Loading** — 12 reference files loaded **only** when relevant failures appear (see `SKILL.md` for the complete reference table).
+### Install from scratch
 
-3. **`[SILENT]` Optimization** — When all probes pass, the pre-scanner outputs `[SILENT]`
+> Install the system-health-watchdog skill. Discover my services and set up the full pipeline.
+
+If you want read-only triage (agent investigates but doesn't auto-fix):
+
+> Install the system-health-watchdog skill, but keep the webhook platform read-only.
+
+### Add a service to monitor
+
+> Add [service name] to the system health watchdog.
+
+### Check status
+
+> What's the status of my system health watchdog?
+
+### Troubleshoot
+
+> The watchdog pre-scanner is reporting failures but no triage agent fires.
+
+> The triage agent fires but just talks and doesn't fix anything.
+
+### Remove a service
+
+> Remove [service name] from the health watchdog catalog.
+
+### Test the pipeline
+
+> Test the watchdog pipeline with a fake failure.
 
 ---
 
-### Design Principles
+## Setup (Manual)
 
-1. **Discovery through introspection, not shell scripts.** The agent discovers what services are running by reading config files, inspecting system/Docker/process tables using its own tools.
+### 1. Create the Webhook Subscription
 
-2. **Stage 1 is observe-only.** The pre-scanner must not modify state, rotate logs, or change configuration. It detects, aggregates, and reports — nothing else.
-
-3. **Safe by design.** Fix commands are curated to pass safety guardrails. No `curl | bash`, no `sudo`, no dangerous patterns. The guardrails stay intact.
-
----
-
-## Quick Start
-
-### 1. Agent-Driven Discovery
-
-When you ask your agent to set up the watchdog, it introspects the environment:
-
-```
-Agent reads config.yaml       → finds MCP servers (command-based, URL-based)
-Agent checks launchd          → finds managed daemons (gateways, dashboard, webui)
-Agent checks Docker           → finds running containers
-Agent checks running processes → finds unsupervised MCP servers
-Agent checks cron jobs        → finds active job schedules
-Agent prompts you             → asks about any additional services
-Agent writes catalog.yaml     → with probes, diagnosis, and fixes for each
+```bash
+hermes webhook subscribe system-health-alerts \
+    --secret INSECURE_NO_AUTH \
+    --deliver discord \
+    --deliver-chat-id <your-channel-id> \
+    --description "Health pre-scanner failures" \
+    --skills system-health-watchdog
 ```
 
-### 2. Validate
+`INSECURE_NO_AUTH` is fine here — the gateway binds to 127.0.0.1, nothing external can reach it. If you've got a public-facing gateway, use a real HMAC secret.
+
+### 2. Create the Pre-Scanner Cron Job
+
+```bash
+hermes cron create \
+    --name system-health-pre-scanner \
+    --schedule "*/15 * * * *" \
+    --script scripts/health-scan.py \
+    --no-agent
+```
+
+The `--no-agent` flag is what makes this free to run. Pure Python, no LLM.
+
+### 3. Validate the Scanner
 
 ```bash
 python3 scripts/health-scan.py
 # → [SILENT] if all probes pass
-# → JSON output if failures found
+# → JSON blob if something's wrong
 ```
 
-### 3. Validate the Pipeline
+### 4. Test the Full Pipeline
 
 ```bash
-# Start test server
-python3 scripts/test-server.py &
-
-# Run scanner — should be [SILENT]
-python3 scripts/health-scan.py
-
-# Kill test server
-kill $(cat /tmp/self-heal-test.pid)
-
-# Run scanner — should show failure JSON
-python3 scripts/health-scan.py
-
-# Restart and verify recovery
-python3 scripts/test-server.py &
-python3 scripts/health-scan.py  # → [SILENT] again
+hermes webhook test system-health-alerts \
+    --payload '{"status":"failures","failed":1,"failed_services":["test"]}'
 ```
 
-### 4. Cron Jobs and Webhooks
+You should see a 🚨 notification in your delivery channel, followed by whatever the triage agent finds.
 
-A cron job that runs tests. On failure, fires a webhook to start triage and repair (if possible and allowed)
+## Adding Services to Watch
 
----
-
-## Catalog Schema
-
-Services are defined in a `catalog.local.yaml` file. Each service has probes (how to check health), diagnosis (what to check when it fails), and fixes (how to recover it).
+Services live in `catalog.local.yaml`. Each service has probes (how to check if it's healthy), diagnosis (what to look at when it fails), and fixes (how to recover it).
 
 ```yaml
 services:
@@ -143,117 +173,64 @@ services:
 
 ### Probe Types
 
-| `type` | Purpose | `passes_if` examples |
-|--------|---------|---------------------|
-| `process` | Run a shell command, check output | `'"PID" in out'`, `"int(out) >= 1"`, `"len(lines) >= 1"` |
-| `http` | HTTP GET to a health endpoint | `"status == 200"` (only `==` supported) |
-| `log_scan` | Scan a log for recent error patterns | `"no ERROR\|CRITICAL"` (diagnosis only) |
-| `file_check` | Check file existence, size, or age | `"exists"`, `"size > 100"` |
-
-> ⚠️ `type: command` does NOT exist. Use `type: process`.
-
-> ⚠️ HTTP probes only support `status == N`. `status < 500`, `status > 200` always fail.
-
-> ⚠️ The `last_exit_ok` fallback (`'"LastExitStatus" = 0'`) is a substring presence check, not a value check. Rely on `process_running` and `http_responding` for real crash detection.
+| `type` | What it does | `passes_if` examples |
+|--------|-------------|---------------------|
+| `process` | Run a shell command, check what it prints | `'"PID" in out'`, `"int(out) >= 1"` |
+| `http` | Hit a URL, check status code | `"status == 200"` (only `==`, no `<` or `>`) |
+| `log_scan` | Scan a log for error patterns | `"no ERROR\|CRITICAL"` (diagnosis only, not a real probe) |
+| `file_check` | Check a file exists, size, or age | `"exists"`, `"size > 100"` |
 
 ### Risk Tiers for Fixes
 
-| Risk | Behavior | Example |
-|------|----------|---------|
-| 🟢 **safe** | Auto-apply silently, verify, report summary | Process restart, launchctl kickstart |
-| 🟡 **caution** | Apply + report details | Full bootout/bootstrap restart |
-| 🔴 **hands_off** | Never auto-apply, explain why | Config edits, env changes, secrets |
+| Risk | What happens | Example |
+|------|-------------|---------|
+| 🟢 **safe** | Auto-apply, verify, quiet summary | `launchctl kickstart` |
+| 🟡 **caution** | Apply, report details | Full bootout/bootstrap |
+| 🔴 **hands_off** | Never auto-apply, just explain | Config edits, env changes |
 
-### Circuit Breaker
-
-- Max 3 auto-remediations per run
-- Per-fix retries: 3 for safe, 1 for caution
-- Exhausted retries → escalate regardless of tier
-- Resets when error resolves
-
----
+The circuit breaker caps auto-fixes at 3 per run, with 3 retries for safe fixes and 1 for caution. If retries run out, it escalates to you. Resets automatically when the error clears.
 
 ## The Pre-Scanner Script
 
-`scripts/health-scan.py` is a standalone Python script that:
+`scripts/health-scan.py` is the piece that actually runs on a schedule. It loads `catalog.local.yaml` (or falls back to `templates/catalog.default.yaml`) and runs each service's probes in dependency order. If DNS is down, there's no point trying to hit APIs yet.
 
-1. Loads `catalog.local.yaml` (falls back to `templates/catalog.default.yaml`)
-2. Runs each service's probes in dependency order
-3. Outputs `[SILENT]` if all green, or JSON with failure details
-4. Uses Python stdlib for HTTP checks (`urllib.request`) — no `curl`
-5. Maintains a persistent error fingerprint state file (`state/health_state.json`)
+It uses Python's stdlib for HTTP checks (`urllib.request`), so there's no `curl` dependency. If everything passes, it prints `[SILENT]`. If something fails, it prints a JSON blob and POSTs the same blob to the gateway webhook with an HMAC signature. It also keeps a state file at `state/health_state.json` so it can tell whether a problem is new or just the same thing still being broken.
 
----
+## Quick Reference: Common Problems
 
-## Error Classes
+| You see | What's probably wrong |
+|---------|----------------------|
+| Failure JSON shows up in chat but no agent fires | HMAC secret mismatch — check gateway logs for `Invalid signature` |
+| Agent fires but just talks, doesn't fix anything | Webhook tool restriction — needs `platform_toolsets.webhook` in config |
+| `Unknown deliver type` error in logs | You used `--deliver discord:123` — needs `--deliver discord --deliver-chat-id 123` |
+| `[SILENT]` never shows | Pre-scanner cron job might not be running — `hermes cron list` |
 
-| Class | Severity | Examples |
-|-------|----------|---------|
-| connection | Critical | ECONNREFUSED, Connection refused |
-| dns | Warning | nodename nor servname provided, gaierror |
-| auth | Critical | 401, 403, token expired |
-| crash | Critical | Traceback, exit code 1 |
-| config | Warning | Config version outdated |
-| rate_limit | Low | 429, Too many requests |
-
----
-
-## Report Modes
-
-```yaml
-global:
-  report_mode: silent    # silent | summary | verbose
-```
-
-| Mode | Behavior |
-|------|----------|
-| **silent** (default) | `[SILENT]` when green. Summary when failures fixed. |
-| **summary** | "3 of 12 failed. 2 auto-fixed. 1 needs attention." |
-| **verbose** | Full pass/fail table with probe results and fix trace. |
-
----
-
-## Cron Wiring Pitfalls
-
-1. **Wrapper path stale on skill move** — use auto-resolving `SCRIPT_DIR` in the wrapper script
-2. **Missing +x bit** — invoke via `python3 script.py` not `exec script.py`
-3. **Cron's sparse PATH** — export common directories (`${HOME}/.local/bin`, platform-specific paths like `/opt/homebrew/bin`) in the wrapper. See `references/cron-pitfalls.md`.
-4. **Python3 without yaml** — use the agent's venv Python path
-5. **Forgotten `context_from`** — verify with `cronjob action=list | grep context_from`
-
----
-
-## Repo Structure
+## Repo Layout
 
 ```
 system-health-watchdog/
-├── README.md                     # This file — human-readable docs
-├── SKILL.md                      # Agent-facing instructions (triggers, onboarding flow)
-├── .gitignore                    # Ignores catalog.local.yaml, state/
+├── README.md                         # This
+├── SKILL.md                          # What the agent reads
+├── .gitignore
+├── catalog.local.yaml                # Your services (gitignored)
 ├── scripts/
-│   ├── health-scan.py            # Pre-scanner — runs all probes (required)
-│   └── test-server.py            # Pipeline validation test
+│   ├── health-scan.py                # The pre-scanner
+│   ├── cron-health-check.py          # Probe for checking cron health
+│   └── test-server.py                # Pipeline test helper
 ├── references/
-│   ├── probe-design.md           # How to write concrete unit tests
-│   └── probe-onboarding.md       # HTTP probe validation workflow
+│   ├── skill-onboarding-and-configuration.md
+│   ├── service-discovery-catalog.md
+│   ├── docker-container-recovery.md
+│   ├── cron-pitfalls.md
+│   ├── probe-design.md
+│   ├── probe-onboarding.md
+│   ├── probe-debugging.md
+│   ├── env-var-wiring.md
+│   └── webhook-delivery-format.md
 └── templates/
-    ├── catalog.default.yaml      # Reference catalog schema
-    └── new-service.md            # Template for adding services
+    ├── catalog.default.yaml
+    └── new-service.md
 ```
-
-### Why no setup.sh or discover.py?
-
-The watchdog originally shipped with shell scripts that parsed plists, grepped process tables, and ran Docker commands to discover services. These were **brittle** — they assumed macOS launchd, Homebrew paths, and specific log locations. On a different OS or configuration, they would silently fail.
-
-Instead, the agent discovers services by **introspecting its own environment** using its native tools:
-- Reading `config.yaml` — finds MCP servers with their command/URL
-- Checking `launchctl list` — finds managed daemons
-- Running `docker ps` — finds containers
-- Scanning `ps aux` — finds unsupervised processes
-
-The agent then builds the catalog itself — no shell scripts needed. This works on any OS the agent can run on, because the agent adapts to what it finds rather than guessing what to find.
-
----
 
 ## License
 
